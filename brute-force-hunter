@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly AUTH_LOG="/var/log/auth.log"
+readonly MAX_FAILED_ATTEMPTS=5
+
+hunt_intruders() {
+    local -r log_file="$1"
+    local -r threshold="$2"
+
+    if [[ ! -r "$log_file" ]]; then
+        printf "ERROR: Cannot read authentication log at '%s'. Check permissions.\n" "$log_file" >&2
+        return 1
+    fi
+
+    # High-Speed Log Parsing Pipeline
+    local attacker_ips
+    attacker_ips=$(grep "Failed password" "$log_file" \
+        | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" \
+        | sort \
+        | uniq -c \
+        | awk -v limit="$threshold" '$1 >= limit {print $2}' || true)
+
+    if [[ -z "$attacker_ips" ]]; then
+        printf "INFO: Perimeter secure. No brute-force anomalies detected.\n"
+        return 0
+    fi
+
+    for ip in $attacker_ips; do
+        # Idempotency Check: Verify IP isn't already blocked before adding rule
+        if ! iptables -C INPUT -s "$ip" -j DROP 2>/dev/null; then
+            iptables -A INPUT -s "$ip" -j DROP
+            printf "ALERT: Hostile IP %s exceeded %s failed attempts. Dropped at kernel firewall.\n" \
+                "$ip" "$threshold" >&2
+        else
+            printf "INFO: Hostile IP %s is already neutralized.\n" "$ip"
+        fi
+    done
+}
+
+main() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        printf "ERROR: Kernel firewall manipulation requires root privileges.\n" >&2
+        exit 1
+    fi
+
+    hunt_intruders "$AUTH_LOG" "$MAX_FAILED_ATTEMPTS"
+}
+
+main "$@"
